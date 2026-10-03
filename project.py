@@ -25,7 +25,10 @@ Default: python project.py
 Optional: python project.py fit --n 1500
 Optional: python project.py live
   today's scoreboard. The current drive starts on the real down.
-  Grades finals against the close. Does not refit weights.
+  Appends one tape row per game. A bet prints only when the spread
+  details string is unchanged from the prior tape row and the spread
+  rule passes. A moved line, or no prior row, is a veto. Grades
+  finals against the close. Does not refit weights.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ import random
 import re
 import sys
 import urllib.request
+from datetime import datetime, timezone
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -1273,6 +1277,7 @@ ODDS_URL = (
     "events/{eid}/competitions/{eid}/odds"
 )
 GRADES_PATH = Path(__file__).resolve().parent / "data" / "grades.jsonl"
+TAPE_PATH = Path(__file__).resolve().parent / "data" / "tape.jsonl"
 
 
 def espn_json(url: str):
@@ -1534,6 +1539,142 @@ def _fetch_odds(eid):
     return eid, (items[0] if items else None)
 
 
+
+def _spread_details(item):
+    """ESPN odds details string, e.g. 'UNLV -1.5'. Not a parsed number."""
+    if not isinstance(item, dict):
+        return None
+    raw = item.get("details")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _status_clock(status):
+    """Clock taken from the scoreboard status. Nothing is invented."""
+    if not isinstance(status, dict):
+        return None
+    stype = status.get("type") or {}
+    state = stype.get("state") or ""
+    if state == "post":
+        detail = stype.get("shortDetail") or stype.get("detail")
+        if detail:
+            return str(detail)
+    display = status.get("displayClock")
+    period = status.get("period")
+    if display not in (None, ""):
+        if period not in (None, "", 0):
+            return "Q{} {}".format(period, display)
+        return str(display)
+    clock = status.get("clock")
+    if clock not in (None, ""):
+        return str(clock)
+    detail = stype.get("shortDetail") or stype.get("detail")
+    return str(detail) if detail else None
+
+
+def _last_play_text(situation):
+    if not isinstance(situation, dict):
+        return None
+    last = situation.get("lastPlay")
+    if not isinstance(last, dict):
+        return None
+    text = last.get("text")
+    if text is None:
+        return None
+    text = str(text).strip()
+    return text or None
+
+
+def load_tape(path=None):
+    path = Path(path) if path is not None else TAPE_PATH
+    rows = []
+    if not path.exists():
+        return rows
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def append_tape(rows, path=None) -> None:
+    """Append rows. Never rewrites or deletes earlier lines."""
+    path = Path(path) if path is not None else TAPE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def prior_tape_rows(rows, event_id):
+    eid = str(event_id)
+    return [row for row in rows if str(row.get("event_id")) == eid]
+
+
+def line_move_veto(prior_rows, spread_details):
+    """Compare this snapshot's spread details to the latest prior tape row.
+
+    No prior row vetoes with 'no prior line'. A changed details string
+    vetoes with 'line moved'. The same string returns None.
+    """
+    if not prior_rows:
+        return {"veto": "no prior line"}
+    old = prior_rows[-1].get("spread_details")
+    new = spread_details
+    if old != new:
+        return {"veto": "line moved", "old": old, "new": new}
+    return None
+
+
+def live_bet_ok(veto, cover, spread) -> bool:
+    """Print a bet only when the line is unchanged and the spread rule passes.
+
+    The spread rule is the existing one: shrunk cover >= 0.58 and the
+    absolute spread under 10. A veto blocks the bet either way.
+    """
+    if veto:
+        return False
+    return bool(allow("spread", cover, spread=spread))
+
+
+def format_live_line(away, home, away_score, home_score, clock, drive,
+                      dog, spread, cover, bet, veto=None) -> str:
+    line = (
+        "{away} @ {home} {away_score}-{home_score} {clock} {drive} "
+        "dog {dog} {spread} shrunk {cover:.3f} bet {bet}".format(
+            away=away,
+            home=home,
+            away_score=away_score,
+            home_score=home_score,
+            clock=clock,
+            drive=drive,
+            dog=dog,
+            spread=spread,
+            cover=cover,
+            bet="true" if bet else "false",
+        )
+    )
+    if not veto:
+        return line
+    kind = veto.get("veto")
+    if kind == "line moved":
+        old = veto.get("old")
+        new = veto.get("new")
+        line += ' veto="line moved" old="{}" new="{}"'.format(
+            "" if old is None else old,
+            "" if new is None else new,
+        )
+    elif kind == "no prior line":
+        line += ' veto="no prior line"'
+    return line
+
+
 def _append_grades(rows):
     GRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
     seen = set()
@@ -1554,18 +1695,24 @@ def _append_grades(rows):
             seen.add(str(row.get("event_id")))
 
 
-def cmd_live(argv=None) -> int:
+def cmd_live(argv=None, tape_path=None) -> int:
     """Price today's non-final games from the real score and grade finals.
 
+    Appends one tape row per game and vetoes a bet when the spread
+    details string already moved, or when this event has no prior row.
     Does not fit betas and does not change a written weight.
     """
+    path = Path(tape_path) if tape_path is not None else TAPE_PATH
     board = espn_json(SCOREBOARD_URL)
     events = list(board.get("events") or [])
     with ThreadPoolExecutor(max_workers=8) as pool:
         odds_rows = list(pool.map(_fetch_odds, [e.get("id") for e in events]))
     odds_by_id = {eid: item for eid, item in odds_rows}
+    prior = load_tape(path)
+    snapshot = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     grades = []
+    tape_rows = []
     for event in events:
         eid = str(event.get("id"))
         comp = (event.get("competitions") or [{}])[0]
@@ -1582,6 +1729,17 @@ def cmd_live(argv=None) -> int:
         item = odds_by_id.get(event.get("id"))
         if item is None:
             item = odds_by_id.get(eid)
+        details = _spread_details(item)
+        situation = comp.get("situation") or {}
+        tape_rows.append({
+            "clock": _status_clock(status),
+            "event_id": eid,
+            "last_play": _last_play_text(situation),
+            "score": "{}-{}".format(away_score, home_score),
+            "short_name": event.get("shortName"),
+            "spread_details": details,
+            "utc": snapshot,
+        })
         prefer = "close" if state == "post" else "current"
         parsed = dog_from_odds(item, home_abbr, away_abbr, prefer=prefer)
         if parsed is None:
@@ -1612,7 +1770,6 @@ def cmd_live(argv=None) -> int:
             })
             continue
 
-        situation = comp.get("situation") or {}
         on_down = _on_down(situation)
         if state == "pre":
             quarter, mins_left = 1, 15.0
@@ -1659,22 +1816,14 @@ def cmd_live(argv=None) -> int:
             possess_is_dog, down, distance, ytg, on_down,
             n=800, seed=20261003,
         )
-        print(
-            "{away} @ {home} {away_score}-{home_score} {clock} {drive} "
-            "dog {dog} {spread} shrunk {cover:.3f} bet {bet}".format(
-                away=away_abbr,
-                home=home_abbr,
-                away_score=away_score,
-                home_score=home_score,
-                clock=clock,
-                drive=drive,
-                dog=dog,
-                spread=_fmt_spread(spread),
-                cover=priced["cover"],
-                bet="true" if priced["bet"] else "false",
-            )
-        )
+        veto = line_move_veto(prior_tape_rows(prior, eid), details)
+        bet = live_bet_ok(veto, priced["cover"], spread)
+        print(format_live_line(
+            away_abbr, home_abbr, away_score, home_score, clock, drive,
+            dog, _fmt_spread(spread), priced["cover"], bet, veto,
+        ))
 
+    append_tape(tape_rows, path)
     _append_grades(grades)
     covers = sum(1 for row in grades if row["covered"])
     print("grades {} graded, {} covers".format(len(grades), covers))

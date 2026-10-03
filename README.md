@@ -13,9 +13,12 @@ score is not an edge. Do not bet real money.
 skips and writes nothing. Synthetic recovery is not NFL data.
 
 `python project.py live` reads the 20261003 NCAAF scoreboard. A game on a
-down is simulated from that down, not a fresh drive. Finals are appended
-to `data/grades.jsonl` and graded against the close. It does not refit
-weights and it does not place a bet.
+down is simulated from that down, not a fresh drive. Each game is appended
+to `data/tape.jsonl` (clock, score, last play, spread details). A bet
+prints only when that spread details string matches the prior tape row
+and the spread rule passes. A moved line or a missing prior row is a veto,
+not a bet. Finals are appended to `data/grades.jsonl` and graded against
+the close. It does not refit weights and it does not place a bet.
 
 `python -m unittest discover -s tests -v` checks tickets, the chain rule,
 the quote decision, and that 4th-and-20 inside the 10 scores less often
