@@ -23,15 +23,23 @@ sportsbook client and no order placement.
 Default: python project.py
   formulas, one chains demo, one Bengals-style sim (n=200), one quote sim.
 Optional: python project.py fit --n 1500
+Optional: python project.py live
+  today's scoreboard. The current drive starts on the real down.
+  Grades finals against the close. Does not refit weights.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import random
+import re
 import sys
+import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
@@ -1250,10 +1258,436 @@ def cmd_fit(argv: List[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Live scoreboard. Current drive starts on the real down. No new weights.
+# Down states alias the written FB coefficients. They are not a fit.
+# ---------------------------------------------------------------------------
+
+ESPN_UA = "Mozilla/5.0"
+SCOREBOARD_URL = (
+    "https://site.api.espn.com/apis/site/v2/sports/football/college-football/"
+    "scoreboard?dates=20261003&limit=80"
+)
+ODDS_URL = (
+    "https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/"
+    "events/{eid}/competitions/{eid}/odds"
+)
+GRADES_PATH = Path(__file__).resolve().parent / "data" / "grades.jsonl"
+
+
+def espn_json(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": ESPN_UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def down_chain_table():
+    """States "1".."4" reuse the written FB rows. No coefficient is new."""
+    return {
+        "1": FB["OPEN"],
+        "2": FB["OPEN"],
+        "3": FB["OPEN"],
+        "4": FB["CHUNK"],
+        "CHUNK": FB["CHUNK"],
+    }
+
+
+def current_drive_start(down) -> str:
+    """The chain's first state is this down, not a fresh OPEN drive."""
+    try:
+        down = int(down)
+    except (TypeError, ValueError):
+        return "OPEN"
+    if down in (1, 2, 3, 4):
+        return str(down)
+    return "OPEN"
+
+
+def situation_drive(down, distance, yards_to_goal, x, rng):
+    """One drive opening on `down`.
+
+    The step uses the written betas (aliased, not refit). A SCORE counts
+    only when the down can finish: distance at most 10. Fourth down also
+    needs the ball inside the opponent's 10, because that late step is one
+    play, not a fresh drive. Early downs inside the offense's own 10 do
+    not cash the whole-drive SCORE either.
+    """
+    start = current_drive_start(down)
+    if start == "OPEN":
+        return fb_drive(x, rng)
+    table = down_chain_table()
+    state = start
+    terminal = "FAIL"
+    for _ in range(4):
+        if state not in table:
+            terminal = state
+            break
+        nxt = edge_step(table, state, x, rng)
+        if nxt in ("SCORE", "FAIL", "NO_EVENT"):
+            terminal = nxt
+            break
+        state = nxt
+    if terminal != "SCORE":
+        return "FAIL"
+    try:
+        distance = float(distance)
+        ytg = float(yards_to_goal)
+    except (TypeError, ValueError):
+        return "FAIL"
+    if distance > 10:
+        return "FAIL"
+    if int(down) >= 4 and ytg > 10:
+        return "FAIL"
+    if int(down) <= 3 and ytg >= 90:
+        return "FAIL"
+    return "SCORE"
+
+
+def drive_score_rate(down, distance, yards_to_goal, n=400, seed=20261003, x=None) -> float:
+    """Fraction of drives that score. Fixed seed. Uses the written betas."""
+    rng = random.Random(seed)
+    feats = {} if x is None else x
+    scores = 0
+    for _ in range(int(n)):
+        if situation_drive(down, distance, yards_to_goal, feats, rng) == "SCORE":
+            scores += 1
+    return scores / float(n)
+
+
+def live_cover(dog_score, fav_score, quarter, mins_left, spread,
+               possess_is_dog, down, distance, yards_to_goal, on_down,
+               n=800, seed=20261003):
+    """Same skeleton as football(), but the current drive is not a fresh OPEN."""
+    rng = random.Random(seed)
+    margin = fav_score - dog_score
+    poss = max(1, int(round(max(0.4, ((4 - quarter) * 15 + mins_left) / 6.5))))
+    covers = 0
+    for _ in range(n):
+        trail = max(0.0, min(1.0, margin / 17))
+        xd = {"pressure_edge": 0.3, "yac_env": 0.35 + 0.15 * trail,
+              "secondary_stress": 0.20, "late_trailing": trail}
+        xf = {"pressure_edge": -0.05, "yac_env": 0.4,
+              "secondary_stress": 0.15, "late_trailing": 0.0}
+        d, f = float(dog_score), float(fav_score)
+        for i in range(poss):
+            use_sit = i == 0 and on_down
+            if use_sit and possess_is_dog:
+                if situation_drive(down, distance, yards_to_goal, xd, rng) == "SCORE":
+                    d += 5.6
+            elif fb_drive(xd, rng) == "SCORE":
+                d += 5.6
+            if use_sit and not possess_is_dog:
+                if situation_drive(down, distance, yards_to_goal, xf, rng) == "SCORE":
+                    f += 6.0
+            elif fb_drive(xf, rng) == "SCORE":
+                f += 6.0
+        noise = 3.2 * math.sqrt(poss / 4)
+        d = max(0.0, rng.gauss(d, noise))
+        f = max(0.0, rng.gauss(f, noise))
+        if d + spread >= f:
+            covers += 1
+    raw = covers / float(n)
+    p = calibrate(raw)
+    return {
+        "raw": raw,
+        "cover": p,
+        "bet": allow("spread", p, spread=spread),
+    }
+
+
+def _spread_number(block):
+    if not isinstance(block, dict):
+        return None
+    ps = block.get("pointSpread") or {}
+    raw = ps.get("american")
+    if raw is None:
+        raw = ps.get("alternateDisplayValue")
+    if raw is None:
+        return None
+    text = str(raw).strip().replace("+", "")
+    if text.upper() in ("EVEN", "PK", "PICK"):
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _match_abbr(token, home_abbr, away_abbr):
+    token = token.upper()
+    exact = []
+    for abbr in (home_abbr, away_abbr):
+        if abbr.upper() == token:
+            exact.append(abbr)
+    if len(exact) == 1:
+        return exact[0]
+    cands = []
+    for abbr in (home_abbr, away_abbr):
+        up = abbr.upper()
+        if up.startswith(token) or token.startswith(up):
+            cands.append(abbr)
+    if len(cands) == 1:
+        return cands[0]
+    return None
+
+
+def dog_from_odds(item, home_abbr, away_abbr, prefer="current"):
+    """Dog and a positive spread. Details like 'OSU -14.5' name the favorite.
+
+    The signed `spread` field is not used: its sign is not stable.
+    """
+    if not item:
+        return None
+    order = ("close", "current", "open") if prefer == "close" else ("current", "close", "open")
+    for key, abbr in (("homeTeamOdds", home_abbr), ("awayTeamOdds", away_abbr)):
+        side = item.get(key) or {}
+        if side.get("underdog") is not True:
+            continue
+        for which in order:
+            num = _spread_number((side.get(which) or {}))
+            if num is None:
+                continue
+            mag = abs(float(num))
+            if mag == 0:
+                return None
+            return abbr, mag
+    details = item.get("details") or ""
+    m = re.match(r"^\s*([A-Za-z0-9&.]+)\s+([+-]?\d+(?:\.\d+)?)\s*$", str(details))
+    if not m:
+        return None
+    token, num = m.group(1), float(m.group(2))
+    mag = abs(num)
+    if mag == 0:
+        return None
+    match = _match_abbr(token, home_abbr, away_abbr)
+    if match is None:
+        return None
+    if num < 0:
+        dog = away_abbr if match == home_abbr else home_abbr
+    else:
+        dog = match
+    return dog, mag
+
+
+def _fmt_spread(spread: float) -> str:
+    if abs(spread - round(spread)) < 1e-9:
+        return "{:+d}".format(int(round(spread)))
+    return "{:+.1f}".format(spread)
+
+
+def _ordinal(down: int) -> str:
+    return {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(down, str(down))
+
+
+def _team_side(comp):
+    home = away = None
+    for c in comp.get("competitors") or []:
+        if c.get("homeAway") == "home":
+            home = c
+        elif c.get("homeAway") == "away":
+            away = c
+    return home, away
+
+
+def _score(comp_side) -> int:
+    try:
+        return int(comp_side.get("score") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _yards_to_goal(situation, home_id, away_id):
+    if not situation:
+        return None
+    poss = situation.get("possession")
+    yl = situation.get("yardLine")
+    if poss is None or yl is None:
+        return None
+    try:
+        yl = float(yl)
+    except (TypeError, ValueError):
+        return None
+    poss = str(poss)
+    if poss == str(home_id):
+        return max(1.0, 100.0 - yl)
+    if poss == str(away_id):
+        return max(1.0, yl)
+    return None
+
+
+def _on_down(situation):
+    if not situation:
+        return False
+    try:
+        down = int(situation.get("down"))
+    except (TypeError, ValueError):
+        return False
+    return down in (1, 2, 3, 4)
+
+
+def _fetch_odds(eid):
+    try:
+        payload = espn_json(ODDS_URL.format(eid=eid))
+    except Exception:
+        return eid, None
+    items = payload.get("items") or []
+    return eid, (items[0] if items else None)
+
+
+def _append_grades(rows):
+    GRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    if GRADES_PATH.exists():
+        for line in GRADES_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                seen.add(str(json.loads(line).get("event_id")))
+            except json.JSONDecodeError:
+                continue
+    with GRADES_PATH.open("a") as fh:
+        for row in rows:
+            if str(row.get("event_id")) in seen:
+                continue
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+            seen.add(str(row.get("event_id")))
+
+
+def cmd_live(argv=None) -> int:
+    """Price today's non-final games from the real score and grade finals.
+
+    Does not fit betas and does not change a written weight.
+    """
+    board = espn_json(SCOREBOARD_URL)
+    events = list(board.get("events") or [])
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        odds_rows = list(pool.map(_fetch_odds, [e.get("id") for e in events]))
+    odds_by_id = {eid: item for eid, item in odds_rows}
+
+    grades = []
+    for event in events:
+        eid = str(event.get("id"))
+        comp = (event.get("competitions") or [{}])[0]
+        status = comp.get("status") or {}
+        stype = status.get("type") or {}
+        state = stype.get("state") or ""
+        home, away = _team_side(comp)
+        if not home or not away:
+            continue
+        home_abbr = home["team"]["abbreviation"]
+        away_abbr = away["team"]["abbreviation"]
+        home_score = _score(home)
+        away_score = _score(away)
+        item = odds_by_id.get(event.get("id"))
+        if item is None:
+            item = odds_by_id.get(eid)
+        prefer = "close" if state == "post" else "current"
+        parsed = dog_from_odds(item, home_abbr, away_abbr, prefer=prefer)
+        if parsed is None:
+            continue
+        dog, spread = parsed
+        if dog == home_abbr:
+            fav = away_abbr
+            dog_score, fav_score = home_score, away_score
+        else:
+            fav = home_abbr
+            dog_score, fav_score = away_score, home_score
+
+        if state == "post":
+            covered = (dog_score + spread) > fav_score
+            grades.append({
+                "away": away_abbr,
+                "away_score": away_score,
+                "covered": bool(covered),
+                "date": "20261003",
+                "dog": dog,
+                "dog_score": dog_score,
+                "event_id": eid,
+                "favorite": fav,
+                "favorite_score": fav_score,
+                "home": home_abbr,
+                "home_score": home_score,
+                "spread": spread,
+            })
+            continue
+
+        situation = comp.get("situation") or {}
+        on_down = _on_down(situation)
+        if state == "pre":
+            quarter, mins_left = 1, 15.0
+            clock = "Q1 15:00"
+            down, distance, ytg = 1, 10, 75.0
+            on_down = True
+            possess_is_dog = (dog == home_abbr)
+            drive = "1st & 10 at the 25"
+        else:
+            period = int(status.get("period") or 1)
+            clock_s = float(status.get("clock") or 0.0)
+            quarter = period if period > 0 else 1
+            mins_left = clock_s / 60.0
+            display = status.get("displayClock") or "0:00"
+            clock = "Q{} {}".format(quarter, display)
+            if on_down:
+                down = int(situation.get("down"))
+                try:
+                    distance = int(situation.get("distance"))
+                except (TypeError, ValueError):
+                    distance = 10
+                if distance <= 0:
+                    distance = 10
+                ytg = _yards_to_goal(situation, home["team"]["id"], away["team"]["id"])
+                if ytg is None:
+                    ytg = 50.0
+                poss = str(situation.get("possession") or "")
+                if poss == str(home["team"]["id"]):
+                    possess_is_dog = dog == home_abbr
+                elif poss == str(away["team"]["id"]):
+                    possess_is_dog = dog == away_abbr
+                else:
+                    possess_is_dog = True
+                text = situation.get("downDistanceText")
+                drive = text if text else "{} & {}".format(_ordinal(down), distance)
+            else:
+                down, distance, ytg = 1, 10, 75.0
+                possess_is_dog = True
+                on_down = False
+                drive = "kickoff"
+
+        priced = live_cover(
+            dog_score, fav_score, quarter, mins_left, spread,
+            possess_is_dog, down, distance, ytg, on_down,
+            n=800, seed=20261003,
+        )
+        print(
+            "{away} @ {home} {away_score}-{home_score} {clock} {drive} "
+            "dog {dog} {spread} shrunk {cover:.3f} bet {bet}".format(
+                away=away_abbr,
+                home=home_abbr,
+                away_score=away_score,
+                home_score=home_score,
+                clock=clock,
+                drive=drive,
+                dog=dog,
+                spread=_fmt_spread(spread),
+                cover=priced["cover"],
+                bet="true" if priced["bet"] else "false",
+            )
+        )
+
+    _append_grades(grades)
+    covers = sum(1 for row in grades if row["covered"])
+    print("grades {} graded, {} covers".format(len(grades), covers))
+    print("weights unchanged; grades saved, not enough real plays to refit.")
+    return 0
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "fit":
         return cmd_fit(argv[1:])
+    if argv and argv[0] == "live":
+        return cmd_live(argv[1:])
     print_formulas()
     print()
     chains_demo()
