@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
 """
-project.py — quotes, chains, and the ledger, in one place.
-
-What is special is only that the quote lab, the five-sport chain rules,
-and the ledger live together: this script, plus data/ledger.xlsx beside
-it. That packaging is not an edge. Do not bet real money.
+project.py — a quote lab, chain demos, and a college-football tape.
 
 Chain betas are unfitted illustrations. `python project.py fit` can fit a
 multinomial logit, but only on synthetic draws, and only if numpy and
-scipy import. A coefficient from that generator is not NFL data and not a
-price.
+scipy import. A coefficient from that generator is not real play data,
+not a price, and not loaded by the live command.
 
 The quote lab knows a latent probability. The strategy never sees it. It
 sees two-sided American quotes. A fill happens only if that posted price
 is still up when the order would arrive. Settlement is one Bernoulli draw
 from the latent probability at the end of the path. PnL is the ticket.
 CLV is the close implied probability minus the implied price you bet.
+Those figures come from the generator. They are not an edge.
 
 Parameters are illustrations. A sim score is not an edge. There is no
-sportsbook client and no order placement.
+sportsbook client and no order placement. data/ledger.xlsx is not opened
+by this script.
 
 Default: python project.py
-  formulas, one chains demo, one Bengals-style sim (n=200), one quote sim.
+  formulas, one five-sport chains demo, one Bengals-style sim (n=200),
+  one quote sim.
 Optional: python project.py fit --n 1500
 Optional: python project.py live
-  today's scoreboard. The current drive starts on the real down.
+  ESPN college-football scoreboard dated 20261003 (hardcoded).
+  The current drive starts on the real down.
   Appends one tape row per game. A bet prints only when the spread
   details string is unchanged from the prior tape row and the spread
-  rule passes. A moved line, or no prior row, is a veto. Grades
-  finals against the close. Does not refit weights.
+  rule passes (shrunk cover >= 0.58 and absolute spread under 10).
+  A moved line, or no prior row, is a veto. Grades finals against
+  the close. Does not refit weights.
 """
 
 from __future__ import annotations
