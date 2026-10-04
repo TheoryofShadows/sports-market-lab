@@ -28,8 +28,10 @@ Optional: python project.py live
   Appends one tape row per game. A bet prints only when the spread
   details string is unchanged from the prior tape row and the spread
   rule passes (shrunk cover >= 0.58 and absolute spread under 10).
-  A moved line, or no prior row, is a veto. Grades finals against
-  the close. Does not refit weights.
+  A moved line, or no prior row, is a veto. When the scoreboard has
+  a quarter and both scores, a favorite lead of 17 or more before
+  halftime is an extra refusal. Grades finals against the close.
+  Does not refit weights.
 """
 
 from __future__ import annotations
@@ -1633,6 +1635,60 @@ def line_move_veto(prior_rows, spread_details):
     return None
 
 
+def prop_allowed(player_available, path_share) -> bool:
+    """True only when both prop checks pass. Not a price."""
+    return player_available >= 0.75 and path_share >= 0.45
+
+
+def live_add_allowed(pregame_points, live_points, deficit) -> bool:
+    """True only when the dog's number has not shrunk past the cushion.
+
+    Points are the dog's number (positive). The check is
+    (live_points - pregame_points) >= deficit - 1.0.
+    """
+    return (live_points - pregame_points) >= deficit - 1.0
+
+
+def favorite_up_17_before_half(quarter, fav_score, dog_score) -> bool:
+    """Kill switch. True means do not print a new bet.
+
+    The favorite leads by 17 or more before halftime (quarter 1 or 2).
+    """
+    return int(quarter) in (1, 2) and (fav_score - dog_score) >= 17
+
+
+def _present_quarter(status):
+    """Quarter from the scoreboard period. Missing or 0 is not a quarter."""
+    if not isinstance(status, dict) or "period" not in status:
+        return None
+    period = status.get("period")
+    if period in (None, "", 0):
+        return None
+    try:
+        quarter = int(period)
+    except (TypeError, ValueError):
+        return None
+    if quarter <= 0:
+        return None
+    return quarter
+
+
+def _present_score(comp_side):
+    """Score only when the competitor object has one. Does not fill in 0."""
+    if not isinstance(comp_side, dict) or "score" not in comp_side:
+        return None
+    raw = comp_side.get("score")
+    if raw is None or raw == "":
+        return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if number == int(number):
+        return int(number)
+    return number
+
+
 def live_bet_ok(veto, cover, spread) -> bool:
     """Print a bet only when the line is unchanged and the spread rule passes.
 
@@ -1673,6 +1729,8 @@ def format_live_line(away, home, away_score, home_score, clock, drive,
         )
     elif kind == "no prior line":
         line += ' veto="no prior line"'
+    elif kind:
+        line += ' veto="{}"'.format(kind)
     return line
 
 
@@ -1701,6 +1759,8 @@ def cmd_live(argv=None, tape_path=None) -> int:
 
     Appends one tape row per game and vetoes a bet when the spread
     details string already moved, or when this event has no prior row.
+    Also refuses a new bet when the board has a quarter and both scores
+    and the favorite leads by 17 or more before halftime.
     Does not fit betas and does not change a written weight.
     """
     path = Path(tape_path) if tape_path is not None else TAPE_PATH
@@ -1818,6 +1878,19 @@ def cmd_live(argv=None, tape_path=None) -> int:
             n=800, seed=20261003,
         )
         veto = line_move_veto(prior_tape_rows(prior, eid), details)
+        # Kill only when the board itself has a quarter and both scores.
+        # The pregame branch above fills quarter and the clock for the
+        # sim. Those fills are not a scoreboard reading.
+        quarter_now = _present_quarter(status)
+        home_now = _present_score(home)
+        away_now = _present_score(away)
+        if quarter_now is not None and home_now is not None and away_now is not None:
+            if dog == home_abbr:
+                kill = favorite_up_17_before_half(quarter_now, away_now, home_now)
+            else:
+                kill = favorite_up_17_before_half(quarter_now, home_now, away_now)
+            if kill and not veto:
+                veto = {"veto": "favorite up 17 before half"}
         bet = live_bet_ok(veto, priced["cover"], spread)
         print(format_live_line(
             away_abbr, home_abbr, away_score, home_score, clock, drive,
